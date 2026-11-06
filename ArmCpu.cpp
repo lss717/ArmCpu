@@ -170,7 +170,7 @@ static uint64_t gBootAffinity = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
-volatile uint64_t armcpu_ppi_probe[6];
+volatile uint64_t armcpu_ppi_probe[10];
 }
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
@@ -345,6 +345,19 @@ void ArmCpu::enableGic (void)
       armcpu_ppi_probe[2] = read32 (redist + 0x10000, 0x80);
       armcpu_ppi_probe[3] = read32 (redist + 0x10000, 0x200);
       armcpu_ppi_probe[4] = *reinterpret_cast<volatile uint8_t *> (redist + 0x10000 + 0x400 + 27);
+      // H120: is the GIC single-security-state (DS) and is this redistributor
+      // awake? Retry the Group assignment once and read it back, so a read-only
+      // group register can be told from a lost write.
+      armcpu_ppi_probe[5] = read32 (dist, 0);
+      armcpu_ppi_probe[6] = read32 (redist, 0x14);
+      armcpu_ppi_probe[9] = read32 (dist, 4);
+      {
+        uint64_t g0 = 0;
+        __asm__ volatile ("mrs %0, icc_igrpen0_el1" : "=r" (g0));
+        armcpu_ppi_probe[7] = g0 & 1;
+      }
+      write32 (redist + 0x10000, 0x80, 0xffffffff);
+      armcpu_ppi_probe[8] = read32 (redist + 0x10000, 0x80);
       __asm__ volatile ("dsb sy" ::: "memory");
     }
   }
