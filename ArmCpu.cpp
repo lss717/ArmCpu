@@ -167,9 +167,6 @@ struct ArmCpuSpi {uint32_t id; void (*handler) (void *); void *context; volatile
 static ArmCpuSpi gSpi[ARMCPU_SPI_SLOTS];
 static volatile uint32_t gSpiUsed = 0;
 static uint64_t gBootAffinity = 0;
-// H114: the boot CPU's redistributor frame, so a diagnostic can read the PPI
-// enable/group/pending bits without repeating the affinity scan.
-static uintptr_t gLocalRedist = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
@@ -298,7 +295,6 @@ bool ArmCpu::wakeRedistributor (bool local)
     offset += gRedistStride != 0 ? gRedistStride : ((typer & 2) != 0 ? 0x40000 : 0x20000);
   }
   if (redist == 0) { return false; }
-  if (local) { gLocalRedist = redist; }
   write32 (redist, 0x14, read32 (redist, 0x14) & ~2U);
   if (!waitClear (redist, 0x14, 4)) { return false; }
   uintptr_t sgi = redist + 0x10000;
@@ -340,6 +336,17 @@ void ArmCpu::enableGic (void)
   if (!secondary || !gRemoteGic) {
     write32 (redist + 0x10000, 0x100, kSgiPpiEnable);
     write32 (dist, 0, read32 (dist, 0) | 0x12U);
+    if (!secondary) {
+      // H118: cache the PPI 27 state here, where the frame is known good.
+      // Reading these registers later from another context crashed the kernel,
+      // so the runtime probe only reports this snapshot.
+      armcpu_ppi_probe[0] = *reinterpret_cast<volatile uint64_t *> (redist + 8);
+      armcpu_ppi_probe[1] = read32 (redist + 0x10000, 0x100);
+      armcpu_ppi_probe[2] = read32 (redist + 0x10000, 0x80);
+      armcpu_ppi_probe[3] = read32 (redist + 0x10000, 0x200);
+      armcpu_ppi_probe[4] = read32 (redist + 0x10000, 0x400 + 27);
+      __asm__ volatile ("dsb sy" ::: "memory");
+    }
   }
   value = 1;
   __asm__ volatile ("msr icc_igrpen1_el1, %0; dsb sy; isb" :: "r" (value) : "memory");
@@ -839,17 +846,6 @@ extern "C" uint64_t armcpu_spi_count (uint32_t intid)
 extern "C" void
 armcpu_probe_ppi27 (void)
 {
-  uintptr_t r = gLocalRedist;
-  if (r == 0) {
-    armcpu_ppi_probe[0] = 0;
-    return;
-  }
-  uintptr_t sgi = r + 0x10000;
-  armcpu_ppi_probe[0] = *reinterpret_cast<volatile uint64_t *> (r + 8);
-  armcpu_ppi_probe[1] = read32 (sgi, 0x100);
-  armcpu_ppi_probe[2] = read32 (sgi, 0x80);
-  armcpu_ppi_probe[3] = read32 (sgi, 0x200);
-  armcpu_ppi_probe[4] = read32 (sgi, 0x400 + 27);
-  armcpu_ppi_probe[5] = 0;
+  /* H118: enableGic() cached the values at init; no runtime GIC MMIO here. */
   __asm__ volatile ("dsb sy" ::: "memory");
 }
