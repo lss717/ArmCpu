@@ -100,7 +100,13 @@ OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 // candidate, but enabling it in enableGic() hung H125 before the first file
 // system read. armcpu_enable_ppi19() now turns it on only after 120 s, from the
 // UFS path, with a storm guard in interrupt().
-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
+// H127: the UEFI handoff dump (H126c) shows GICR_ISENABLER0 = 0x240C0000 from the
+// non-secure view at handoff, i.e. PPIs 18, 19, 26 and 29 are Group 1 NS and
+// already enabled, and IGROUPR0 is RAZ/WI from NS (it reads 0 whatever the real
+// group is). TWRP/Linux runs its arch_timer on INTID 19. This driver used to
+// disable all of them and watch only the architectural PPI 27, so enable every
+// PPI plus the SGIs and let interrupt() report which INTIDs really arrive.
+static const uint32_t kSgiPpiEnable = 0xffffU | 0xffff0000U;
 
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
 
@@ -194,6 +200,8 @@ volatile uint32_t armcpu_ppi19_done = 0;
 volatile uint32_t armcpu_ppi19_isen_before = 0;
 volatile uint32_t armcpu_ppi19_isen_after = 0;
 volatile uint32_t armcpu_ppi19_pend = 0;
+// H127: bit n set when INTID 16+n has been delivered to this CPU.
+volatile uint32_t armcpu_ppi_seen = 0;
 }
 static uintptr_t gBootRedist = 0;   // boot CPU's own redistributor frame, for the late PPI 19 enable
 
@@ -672,20 +680,24 @@ void ArmCpu::interrupt (void)
       break;
     }
     if(diagnosePower && drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
-    if (((id & 0xffffff) == 27) || ((id & 0xffffff) == 19)) {
-      // H125: accept both candidate timer PPIs; the counters show which one the
-      // SoC actually asserts. If both ever arrive, rtclock_intr() is idempotent
-      // for a tick that already consumed the elapsed time.
-      if ((id & 0xffffff) == 19) {
+    if (((id & 0xffffff) >= 16) && ((id & 0xffffff) <= 31)) {
+      // H127: report every PPI that reaches EL1 instead of panicking on the
+      // unexpected ones. 19 (TWRP's arch_timer) and 27 (architectural virtual
+      // timer) drive the clock; the rest are only counted.
+      const uint32_t ppi = static_cast<uint32_t> (id & 0xffffff);
+      armcpu_ppi_seen = armcpu_ppi_seen | (1U << (ppi - 16));
+      if (ppi == 19) {
         armcpu_timer19_interrupts = armcpu_timer19_interrupts + 1;
-      } else {
+      } else if (ppi == 27) {
         armcpu_timer27_interrupts = armcpu_timer27_interrupts + 1;
       }
-      armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
-      armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
-      armcpu_irq_phase=2;
-      rtclock_intr (0);
-      armcpu_irq_phase=3;
+      if ((ppi == 19) || (ppi == 27)) {
+        armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
+        armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
+        armcpu_irq_phase=2;
+        rtclock_intr (0);
+        armcpu_irq_phase=3;
+      }
     } else if ((id & 0xffffff) == 0) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
