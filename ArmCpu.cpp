@@ -30,6 +30,10 @@ volatile uint64_t armcpu_timer_interrupts = 0;
 volatile uint64_t armcpu_timer19_interrupts = 0;
 volatile uint64_t armcpu_timer27_interrupts = 0;
 volatile uint32_t armcpu_irq_storm_id = 0xffffffffU;
+// H127d: 0 until NativeUfsProbe declares the clock usable (120 s). Before that
+// PPI 19 is counted only; after it, PPI 19 drives rtclock_intr and re-arms
+// CNTV so the level line de-asserts (the count-only build fired ~400k/s).
+volatile uint32_t armcpu_timer_dispatch = 0;
 volatile uint64_t armcpu_irq_storm_count = 0;
 volatile uint64_t armcpu_ipi_interrupts = 0;
 volatile uint64_t armcpu_ipi_sent = 0;       // SGIs the kernel asked ArmCpu::signalCPU to send
@@ -629,12 +633,20 @@ void ArmCpu::interrupt (void)
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
       armcpu_irq_phase=2;
-      // H127c: PPI 19 is counted but does NOT drive rtclock_intr() yet. H125,
-      // H127 and H127b all stopped right around the first file system I/O when
-      // 19 fed the clock this early, so first prove that 19 is delivered at all;
-      // the storm guard masks it after the burst and the boot continues.
-      if ((id & 0xffffff) == 27) {
+      // H127d: before armcpu_timer_dispatch is set, PPI 19 is only counted
+      // (H127c proved it arrives and the boot survives). Once the UFS path has
+      // declared the clock usable, it drives rtclock_intr and re-arms CNTV so
+      // the level line de-asserts.
+      if (((id & 0xffffff) == 27) || armcpu_timer_dispatch) {
         rtclock_intr (0);
+      }
+      if (((id & 0xffffff) == 19) && armcpu_timer_dispatch) {
+        // 10 ms at 19.2 MHz keeps the interrupt rate at 100 Hz even if the
+        // kernel's own deadline programming is not ready for this INTID yet.
+        uint64_t tval = 192000ULL;
+        uint64_t ctl = 1ULL;
+        __asm__ volatile ("msr cntv_tval_el0, %0\n\tmsr cntv_ctl_el0, %1\n\tisb"
+                          :: "r" (tval), "r" (ctl) : "memory");
       }
       armcpu_irq_phase=3;
     } else if ((id & 0xffffff) == 0) {
