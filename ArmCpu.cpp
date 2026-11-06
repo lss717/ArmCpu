@@ -344,7 +344,7 @@ void ArmCpu::enableGic (void)
       armcpu_ppi_probe[1] = read32 (redist + 0x10000, 0x100);
       armcpu_ppi_probe[2] = read32 (redist + 0x10000, 0x80);
       armcpu_ppi_probe[3] = read32 (redist + 0x10000, 0x200);
-      armcpu_ppi_probe[4] = read32 (redist + 0x10000, 0x400 + 27);
+      armcpu_ppi_probe[4] = *reinterpret_cast<volatile uint8_t *> (redist + 0x10000 + 0x400 + 27);
       __asm__ volatile ("dsb sy" ::: "memory");
     }
   }
