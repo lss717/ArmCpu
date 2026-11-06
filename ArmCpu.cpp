@@ -23,6 +23,12 @@ extern "C" {
 volatile uint32_t armcpu_registered = 0;
 volatile uint32_t armcpu_gic_ready = 0;
 volatile uint64_t armcpu_timer_interrupts = 0;
+// H125: split the timer count by INTID. TWRP's Linux reports the armv8 virtual
+// timer on GICv3 hwirq 19 on this SoC (`arch_timer` = "GICv3 19", dmesg
+// "Architected ... (virt/virt)"), not the architectural PPI 27 that this driver
+// used to watch. Both are enabled so one boot tells which one really arrives.
+volatile uint64_t armcpu_timer19_interrupts = 0;
+volatile uint64_t armcpu_timer27_interrupts = 0;
 volatile uint64_t armcpu_ipi_interrupts = 0;
 volatile uint64_t armcpu_ipi_sent = 0;       // SGIs the kernel asked ArmCpu::signalCPU to send
 volatile uint64_t armcpu_ipi_selftest_sent = 0;
@@ -86,8 +92,12 @@ public:
 
 OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 
-// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
+// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts)
+// and PPI 19 + PPI 27. H125: the stock MSM8998 device tree maps the armv8 timer
+// to GIC_PPI 1/2/3/0, i.e. INTIDs 17/18/19/16, and the TWRP Linux boot reports
+// its working arch_timer as "GICv3 19" with dmesg "(virt/virt)". PPI 27 is the
+// architectural virtual-timer INTID and stays enabled as the A/B control.
+static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 19) | (1U << 27);
 
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
 
@@ -170,7 +180,7 @@ static uint64_t gBootAffinity = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
-volatile uint64_t armcpu_ppi_probe[13];
+volatile uint64_t armcpu_ppi_probe[20];
 }
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
@@ -366,6 +376,21 @@ void ArmCpu::enableGic (void)
       armcpu_ppi_probe[11] = read32 (redist + 0x10000, 0x100);
       write32 (redist + 0x10000, 0x80, 1U << 27);
       armcpu_ppi_probe[12] = read32 (redist + 0x10000, 0x80);
+      // H125: is INTID 19 writable, and can non-secure flip the distributor to
+      // single-security-state? 13 IGROUPR0 after (1<<19)|(1<<27);
+      // 14 ISENABLER0 after clearing 19; 15 after setting 19 again;
+      // 16 a later ISPENDR0 sample; 17 GICD_CTLR after trying to set DS(bit6);
+      // 18 GICD_IGROUPR1 (first SPI group word, read-only here).
+      write32 (redist + 0x10000, 0x80, (1U << 19) | (1U << 27));
+      armcpu_ppi_probe[13] = read32 (redist + 0x10000, 0x80);
+      write32 (redist + 0x10000, 0x180, 1U << 19);
+      armcpu_ppi_probe[14] = read32 (redist + 0x10000, 0x100);
+      write32 (redist + 0x10000, 0x100, (1U << 19) | (1U << 27));
+      armcpu_ppi_probe[15] = read32 (redist + 0x10000, 0x100);
+      armcpu_ppi_probe[16] = read32 (redist + 0x10000, 0x200);
+      write32 (dist, 0, read32 (dist, 0) | 0x40U);
+      armcpu_ppi_probe[17] = read32 (dist, 0);
+      armcpu_ppi_probe[18] = read32 (dist, 0x84);
       __asm__ volatile ("dsb sy" ::: "memory");
     }
   }
@@ -598,7 +623,15 @@ void ArmCpu::interrupt (void)
     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
     if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
     if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
-    if ((id & 0xffffff) == 27) {
+    if (((id & 0xffffff) == 27) || ((id & 0xffffff) == 19)) {
+      // H125: accept both candidate timer PPIs; the counters show which one the
+      // SoC actually asserts. If both ever arrive, rtclock_intr() is idempotent
+      // for a tick that already consumed the elapsed time.
+      if ((id & 0xffffff) == 19) {
+        armcpu_timer19_interrupts = armcpu_timer19_interrupts + 1;
+      } else {
+        armcpu_timer27_interrupts = armcpu_timer27_interrupts + 1;
+      }
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
       armcpu_irq_phase=2;
