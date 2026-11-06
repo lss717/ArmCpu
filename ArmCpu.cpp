@@ -30,11 +30,11 @@ volatile uint64_t armcpu_timer_interrupts = 0;
 volatile uint64_t armcpu_timer19_interrupts = 0;
 volatile uint64_t armcpu_timer27_interrupts = 0;
 volatile uint32_t armcpu_irq_storm_id = 0xffffffffU;
-// H127e: 0 until NativeUfsProbe starts the late rearm-only test (120 s). PPI 19
-// is counted before that; after it, PPI 19 only writes CNTV_TVAL and still does
-// not call rtclock_intr. This isolates timer rearming from clock dispatch.
+// H127f: 0 until NativeUfsProbe enables late PPI 19 clock dispatch (120 s).
+// Before that PPI 19 is count-only; afterwards it enters rtclock_intr and lets
+// XNU program the next deadline. No manual CNTV_TVAL override is performed.
 volatile uint32_t armcpu_timer_dispatch = 0;
-volatile uint64_t armcpu_timer_rearm_count = 0;
+volatile uint64_t armcpu_timer19_rtclock_count = 0;
 volatile uint64_t armcpu_irq_storm_count = 0;
 volatile uint64_t armcpu_ipi_interrupts = 0;
 volatile uint64_t armcpu_ipi_sent = 0;       // SGIs the kernel asked ArmCpu::signalCPU to send
@@ -634,17 +634,15 @@ void ArmCpu::interrupt (void)
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
       armcpu_irq_phase=2;
-      // H127e separates rearming from clock dispatch. Before the UFS path
-      // enables the experiment, PPI 19 is count-only (H127c). Afterwards, PPI
-      // 19 only moves CNTV 10 ms into the future; it does not call
-      // rtclock_intr(), so the measured interrupt rate proves whether this
-      // register write actually deasserts the source. PPI 27 keeps its baseline
+      // H127f separates early timer delivery from clock dispatch. Before the
+      // UFS path enables the experiment, PPI 19 is count-only (H127c). Afterwards
+      // it calls rtclock_intr() and lets XNU's normal timer-deadline path program
+      // CNTV. Do not manually overwrite CNTV_TVAL here. PPI 27 keeps its baseline
       // clock path.
       if ((id & 0xffffff) == 19) {
         if (armcpu_timer_dispatch) {
-          const uint64_t tval = 192000ULL; // 10 ms at the 19.2 MHz counter rate
-          __asm__ volatile ("msr cntv_tval_el0, %0; isb" :: "r" (tval) : "memory");
-          armcpu_timer_rearm_count = armcpu_timer_rearm_count + 1;
+          armcpu_timer19_rtclock_count = armcpu_timer19_rtclock_count + 1;
+          rtclock_intr (0);
         }
       } else {
         rtclock_intr (0);
