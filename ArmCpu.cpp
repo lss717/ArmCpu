@@ -170,7 +170,7 @@ static uint64_t gBootAffinity = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
-volatile uint64_t armcpu_ppi_probe[10];
+volatile uint64_t armcpu_ppi_probe[13];
 }
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
@@ -356,6 +356,16 @@ void ArmCpu::enableGic (void)
       armcpu_ppi_probe[7] = 0;
       write32 (redist + 0x10000, 0x80, 0xffffffff);
       armcpu_ppi_probe[8] = read32 (redist + 0x10000, 0x80);
+      // H122: prove MMIO writes land by toggling PPI 27 in ISENABLER0, then try
+      // to move only PPI 27 to Group 1. If the enable toggles but the group stays
+      // 0, the secure world owns the timer PPIs and the non-secure kernel cannot
+      // take their interrupts.
+      write32 (redist + 0x10000, 0x180, 1U << 27);
+      armcpu_ppi_probe[10] = read32 (redist + 0x10000, 0x100);
+      write32 (redist + 0x10000, 0x100, 1U << 27);
+      armcpu_ppi_probe[11] = read32 (redist + 0x10000, 0x100);
+      write32 (redist + 0x10000, 0x80, 1U << 27);
+      armcpu_ppi_probe[12] = read32 (redist + 0x10000, 0x80);
       __asm__ volatile ("dsb sy" ::: "memory");
     }
   }
