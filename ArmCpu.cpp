@@ -30,11 +30,12 @@ volatile uint64_t armcpu_timer_interrupts = 0;
 volatile uint64_t armcpu_timer19_interrupts = 0;
 volatile uint64_t armcpu_timer27_interrupts = 0;
 volatile uint32_t armcpu_irq_storm_id = 0xffffffffU;
-// H127f: 0 until NativeUfsProbe enables late PPI 19 clock dispatch (120 s).
-// Before that PPI 19 is count-only; afterwards it enters rtclock_intr and lets
-// XNU program the next deadline. No manual CNTV_TVAL override is performed.
-volatile uint32_t armcpu_timer_dispatch = 0;
+// H127g: PPI 19 drives rtclock_intr from the very first interrupt, and if XNU
+// did not arm the next deadline (CNTV_CTL.ISTATUS still set) a 10 ms tick is
+// programmed here so the level line de-asserts and timer_call keeps running.
+// forced counts the fallback path; a small value means XNU armed it itself.
 volatile uint64_t armcpu_timer19_rtclock_count = 0;
+volatile uint64_t armcpu_timer19_forced_count = 0;
 volatile uint64_t armcpu_irq_storm_count = 0;
 volatile uint64_t armcpu_ipi_interrupts = 0;
 volatile uint64_t armcpu_ipi_sent = 0;       // SGIs the kernel asked ArmCpu::signalCPU to send
@@ -634,15 +635,19 @@ void ArmCpu::interrupt (void)
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
       armcpu_irq_phase=2;
-      // H127f separates early timer delivery from clock dispatch. Before the
-      // UFS path enables the experiment, PPI 19 is count-only (H127c). Afterwards
-      // it calls rtclock_intr() and lets XNU's normal timer-deadline path program
-      // CNTV. Do not manually overwrite CNTV_TVAL here. PPI 27 keeps its baseline
-      // clock path.
+      // H127g: run the clock path from the first PPI 19, then make sure the
+      // level line is actually de-asserted. XNU usually programs the next
+      // deadline itself; if ISTATUS is still set afterwards, arm a 10 ms tick
+      // so the storm cannot happen and timer_call keeps getting serviced.
       if ((id & 0xffffff) == 19) {
-        if (armcpu_timer_dispatch) {
-          armcpu_timer19_rtclock_count = armcpu_timer19_rtclock_count + 1;
-          rtclock_intr (0);
+        armcpu_timer19_rtclock_count = armcpu_timer19_rtclock_count + 1;
+        rtclock_intr (0);
+        uint64_t ctl = 0;
+        __asm__ volatile ("mrs %0, cntv_ctl_el0; isb" : "=r" (ctl));
+        if ((ctl & 4ULL) != 0) {
+          const uint64_t tval = 192000ULL; // 10 ms at the 19.2 MHz counter rate
+          __asm__ volatile ("msr cntv_tval_el0, %0; isb" :: "r" (tval) : "memory");
+          armcpu_timer19_forced_count = armcpu_timer19_forced_count + 1;
         }
       } else {
         rtclock_intr (0);
