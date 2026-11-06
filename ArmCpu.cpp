@@ -167,9 +167,13 @@ struct ArmCpuSpi {uint32_t id; void (*handler) (void *); void *context; volatile
 static ArmCpuSpi gSpi[ARMCPU_SPI_SLOTS];
 static volatile uint32_t gSpiUsed = 0;
 static uint64_t gBootAffinity = 0;
+// H114: the boot CPU's redistributor frame, so a diagnostic can read the PPI
+// enable/group/pending bits without repeating the affinity scan.
+static uintptr_t gLocalRedist = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
+volatile uint64_t armcpu_ppi_probe[6];
 }
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
@@ -294,6 +298,7 @@ bool ArmCpu::wakeRedistributor (bool local)
     offset += gRedistStride != 0 ? gRedistStride : ((typer & 2) != 0 ? 0x40000 : 0x20000);
   }
   if (redist == 0) { return false; }
+  if (local) { gLocalRedist = redist; }
   write32 (redist, 0x14, read32 (redist, 0x14) & ~2U);
   if (!waitClear (redist, 0x14, 4)) { return false; }
   uintptr_t sgi = redist + 0x10000;
@@ -820,4 +825,31 @@ extern "C" uint64_t armcpu_spi_count (uint32_t intid)
     if (gSpi[slot].id == intid) { return gSpi[slot].count; }
   }
   return 0;
+}
+
+/*
+ * H114 diagnostic: read the boot CPU's redistributor state for the virtual timer
+ * PPI (INTID 27). The H113 sample showed CNTV_CTL=0b101 (enabled, unmasked,
+ * ISTATUS set) while no INTID 27 ever reached ArmCpu::interrupt(), so the next
+ * question is whether the PPI is enabled, Group 1, pending and prioritised on
+ * this CPU's own redistributor frame.
+ *   [0] GICR_TYPER      [1] ISENABLER0   [2] IGROUPR0
+ *   [3] ISPENDR0        [4] IPRIORITYR[27]
+ */
+extern "C" void
+armcpu_probe_ppi27 (void)
+{
+  uintptr_t r = gLocalRedist;
+  if (r == 0) {
+    armcpu_ppi_probe[0] = 0;
+    return;
+  }
+  uintptr_t sgi = r + 0x10000;
+  armcpu_ppi_probe[0] = *reinterpret_cast<volatile uint64_t *> (r + 8);
+  armcpu_ppi_probe[1] = read32 (sgi, 0x100);
+  armcpu_ppi_probe[2] = read32 (sgi, 0x80);
+  armcpu_ppi_probe[3] = read32 (sgi, 0x200);
+  armcpu_ppi_probe[4] = read32 (sgi, 0x400 + 27);
+  armcpu_ppi_probe[5] = 0;
+  __asm__ volatile ("dsb sy" ::: "memory");
 }
