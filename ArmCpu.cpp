@@ -93,11 +93,14 @@ public:
 OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 
 // Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts)
-// and PPI 19 + PPI 27. H125: the stock MSM8998 device tree maps the armv8 timer
-// to GIC_PPI 1/2/3/0, i.e. INTIDs 17/18/19/16, and the TWRP Linux boot reports
-// its working arch_timer as "GICv3 19" with dmesg "(virt/virt)". PPI 27 is the
-// architectural virtual-timer INTID and stays enabled as the A/B control.
-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 19) | (1U << 27);
+// and PPI 27 (the architectural virtual-timer INTID, the H122 baseline).
+// H125b: PPI 19 is NOT enabled here. The stock MSM8998 device tree maps the
+// armv8 timer to GIC_PPI 1/2/3/0 (INTIDs 17/18/19/16) and TWRP's Linux reports
+// its arch_timer as "GICv3 19" (dmesg "(virt/virt)"), so 19 is the A/B
+// candidate, but enabling it in enableGic() hung H125 before the first file
+// system read. armcpu_enable_ppi19() now turns it on only after 120 s, from the
+// UFS path, with a storm guard in interrupt().
+static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
 
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
 
@@ -181,7 +184,18 @@ extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
 volatile uint64_t armcpu_ppi_probe[20];
+// H125b: defer the PPI 19 experiment to a known-good late point, and make a
+// level-triggered interrupt storm survivable. armcpu_irq_first_id records the
+// first INTID ever taken; a storm masks that INTID and counts it.
+volatile uint32_t armcpu_irq_first_id = 0xffffffffU;
+volatile uint32_t armcpu_irq_storm_id = 0xffffffffU;
+volatile uint64_t armcpu_irq_storm_count = 0;
+volatile uint32_t armcpu_ppi19_done = 0;
+volatile uint32_t armcpu_ppi19_isen_before = 0;
+volatile uint32_t armcpu_ppi19_isen_after = 0;
+volatile uint32_t armcpu_ppi19_pend = 0;
 }
+static uintptr_t gBootRedist = 0;   // boot CPU's own redistributor frame, for the late PPI 19 enable
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
 {
@@ -299,6 +313,7 @@ bool ArmCpu::wakeRedistributor (bool local)
     armcpu_gic_typer_probe[1] = static_cast<uint32_t> (typer);
     if (static_cast<uint32_t> (typer >> 32) == target) {
       redist = frames + offset;
+      if (local) { gBootRedist = redist; }
       break;
     }
     if ((typer & 16) != 0) { break; }
@@ -376,19 +391,15 @@ void ArmCpu::enableGic (void)
       armcpu_ppi_probe[11] = read32 (redist + 0x10000, 0x100);
       write32 (redist + 0x10000, 0x80, 1U << 27);
       armcpu_ppi_probe[12] = read32 (redist + 0x10000, 0x80);
-      // H125: is INTID 19 writable, and can non-secure flip the distributor to
-      // single-security-state? 13 IGROUPR0 after (1<<19)|(1<<27);
-      // 14 ISENABLER0 after clearing 19; 15 after setting 19 again;
-      // 16 a later ISPENDR0 sample; 17 GICD_CTLR after trying to set DS(bit6);
-      // 18 GICD_IGROUPR1 (first SPI group word, read-only here).
-      write32 (redist + 0x10000, 0x80, (1U << 19) | (1U << 27));
+      // H125b: read-only samples only. The H125 build wrote IGROUPR0 with
+      // (1<<19)|(1<<27) and then tried GICD_CTLR.DS=1 here; that boot hung
+      // before the first file system read, so no write test stays in the
+      // early path. 13 IGROUPR0 read, 14 ISENABLER0 read, 15/16 ISPENDR0
+      // samples, 17 GICD_CTLR read, 18 GICD_IGROUPR1 read.
       armcpu_ppi_probe[13] = read32 (redist + 0x10000, 0x80);
-      write32 (redist + 0x10000, 0x180, 1U << 19);
       armcpu_ppi_probe[14] = read32 (redist + 0x10000, 0x100);
-      write32 (redist + 0x10000, 0x100, (1U << 19) | (1U << 27));
-      armcpu_ppi_probe[15] = read32 (redist + 0x10000, 0x100);
+      armcpu_ppi_probe[15] = read32 (redist + 0x10000, 0x200);
       armcpu_ppi_probe[16] = read32 (redist + 0x10000, 0x200);
-      write32 (dist, 0, read32 (dist, 0) | 0x40U);
       armcpu_ppi_probe[17] = read32 (dist, 0);
       armcpu_ppi_probe[18] = read32 (dist, 0x84);
       __asm__ volatile ("dsb sy" ::: "memory");
@@ -411,6 +422,25 @@ void ArmCpu::enableGic (void)
     armcpu_gic_boot[7] = static_cast<uint32_t> (sre);
   }
   armcpu_gic_ready = 1;
+}
+
+// H125b: enable PPI 19 long after boot, from a known-good context (the UFS
+// read path), and record what the redistributor says. If the timer really lands
+// on INTID 19 this starts the timer interrupt; if 19 is the wrong line the
+// storm guard in interrupt() masks it again and the boot survives.
+extern "C" void
+armcpu_enable_ppi19 (void)
+{
+  if (armcpu_ppi19_done || (gBootRedist == 0) || !armcpu_gic_ready) {
+    return;
+  }
+  uintptr_t sgi = gBootRedist + 0x10000;
+  armcpu_ppi19_isen_before = read32 (sgi, 0x100);
+  write32 (sgi, 0x100, (1U << 19) | (1U << 27));
+  __asm__ volatile ("dsb sy" ::: "memory");
+  armcpu_ppi19_isen_after = read32 (sgi, 0x100);
+  armcpu_ppi19_pend = read32 (sgi, 0x200);
+  armcpu_ppi19_done = 1;
 }
 
 
@@ -622,7 +652,26 @@ void ArmCpu::interrupt (void)
     __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (id));
     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
     if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
-    if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
+    if (armcpu_irq_first_id == 0xffffffffU) {
+      armcpu_irq_first_id = static_cast<uint32_t> (id & 0xffffff);
+    }
+    // H125b: a level-triggered line with no real consumer re-asserts the moment
+    // it is EOI'd and would spin here forever (upstream uefi-sheng's
+    // Gic-Spurious.patch does the same for EDK2). Mask the offending INTID and
+    // let the boot continue, recording which line it was.
+    if (++drained > 32) {
+      const uint32_t sid = static_cast<uint32_t> (id & 0xffffff);
+      if (sid < 32) {
+        write32 (redist + 0x10000, 0x180, 1U << sid);
+      } else if (gDist != 0) {
+        write32 (gDist, 0x180 + (sid / 32) * 4, 1U << (sid % 32));
+      }
+      armcpu_irq_storm_id = sid;
+      armcpu_irq_storm_count = armcpu_irq_storm_count + 1;
+      __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (id) : "memory");
+      break;
+    }
+    if(diagnosePower && drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
     if (((id & 0xffffff) == 27) || ((id & 0xffffff) == 19)) {
       // H125: accept both candidate timer PPIs; the counters show which one the
       // SoC actually asserts. If both ever arrive, rtclock_intr() is idempotent
