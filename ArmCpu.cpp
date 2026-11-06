@@ -351,11 +351,9 @@ void ArmCpu::enableGic (void)
       armcpu_ppi_probe[5] = read32 (dist, 0);
       armcpu_ppi_probe[6] = read32 (redist, 0x14);
       armcpu_ppi_probe[9] = read32 (dist, 4);
-      {
-        uint64_t g0 = 0;
-        __asm__ volatile ("mrs %0, icc_igrpen0_el1" : "=r" (g0));
-        armcpu_ppi_probe[7] = g0 & 1;
-      }
+      /* H121: ICC_IGRPEN0_EL1 is a Group 0 register; reading it hangs the boot,
+       * like HPPIR0 did, so it is not sampled. */
+      armcpu_ppi_probe[7] = 0;
       write32 (redist + 0x10000, 0x80, 0xffffffff);
       armcpu_ppi_probe[8] = read32 (redist + 0x10000, 0x80);
       __asm__ volatile ("dsb sy" ::: "memory");
