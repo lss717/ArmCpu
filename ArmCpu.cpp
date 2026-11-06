@@ -629,7 +629,13 @@ void ArmCpu::interrupt (void)
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
       armcpu_irq_phase=2;
-      rtclock_intr (0);
+      // H127c: PPI 19 is counted but does NOT drive rtclock_intr() yet. H125,
+      // H127 and H127b all stopped right around the first file system I/O when
+      // 19 fed the clock this early, so first prove that 19 is delivered at all;
+      // the storm guard masks it after the burst and the boot continues.
+      if ((id & 0xffffff) == 27) {
+        rtclock_intr (0);
+      }
       armcpu_irq_phase=3;
     } else if ((id & 0xffffff) == 0) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
